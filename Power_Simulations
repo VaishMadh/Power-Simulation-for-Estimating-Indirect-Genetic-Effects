@@ -1,0 +1,321 @@
+###############################################################################
+# Power simulation for trio-based regression with genetic predictors
+#
+# We simulate correlated polygenic scores / genetic liabilities for:
+#   G1 = Child
+#   G2 = Mother
+#   G3 = Father
+#   G4 = Sibling
+#
+# We create two analysis scenarios:
+#   1) "C + Pa only": Only Child (C) and Parental mean (Pa = mom + dad) have
+#      non-zero causal effects. We fit the regression P ~ C + Pa.
+#      Relative effect allocation on the b^2 scale: (C, mom, dad) = (.5, .25, .25).
+#
+#   2) "C + Pa + S": Child, Parental mean, and Sibling have non-zero causal effects.
+#      We fit the regression P ~ C + Pa + S.
+#      Relative effect allocation on the b^2 scale: (C, mom, dad, sib) = (.5, 1/6, 1/6, 1/6)
+#      i.e., (.5, .5/3, .5/3, .5/3).
+#
+# Across sample sizes N = 1000..30000, we simulate 'reps' Monte Carlo replicates
+# and estimate power for one-sided tests H1: beta > 0 at alpha = 0.025 (the classical 2 sided p = 0.05 for b > 0 boundary of Z ~ 1.96 ish).
+#
+# We repeat this for three total R^2 settings: 1%, 2.5%, 7.5%.
+#
+# Output:
+#   A 2 (scenario rows) x 3 (R^2 columns) ggplot panel grid with power curves
+#   for each tested effect (C, Pa, and S where applicable).
+###############################################################################
+
+library(MASS)
+library(ggplot2)
+library(scales)
+
+set.seed(1)
+
+# -----------------------------------------------------------------------------
+# USER PARAMETERS
+# -----------------------------------------------------------------------------
+
+# Assortment parameter: genetic correlation between parents (mom-dad).
+# Set rg_p = 0 for no assortment; >0 for assortative mating.
+rg_p <- 0
+
+# In the "standard trio" approximation used here, the child-parent genetic
+# correlation is (1 + rg_p) / 2. When rg_p = 0, rho = 0.5.
+# NOTE: We're also using rho for child-sibling
+rho <- (1 + rg_p) / 2
+
+# One-sided test at alpha=0.025 (same critical boundary as two-sided 0.05,
+# but we are explicitly testing beta > 0).
+alpha_one <- 0.025
+
+# Monte Carlo replicates per N
+reps <- 100
+
+# Sample sizes to evaluate
+Ns <- seq(1000, 30000, by = 1000)
+
+# Total variance explained (total R^2) settings
+R2_grid <- c(0.01, 0.025, 0.075)
+
+# -----------------------------------------------------------------------------
+# COVARIANCE STRUCTURES FOR THE GENETIC VARIABLES
+# -----------------------------------------------------------------------------
+# We treat each G as mean 0, variance 1, jointly multivariate normal.
+#
+# Sigma3: for (child, mom, dad)
+# Sigma4: for (child, mom, dad, sibling)
+#
+# Off-diagonals:
+#   corr(child, mom) = rho
+#   corr(child, dad) = rho
+#   corr(mom, dad)   = rg_p     (assortment)
+#   corr(child, sib) = rho      (simplified)
+#   corr(mom, sib)   = rho      (simplified)
+#   corr(dad, sib)   = rho      (simplified)
+#
+# If you want a more genetics-faithful structure for sibling correlations under
+# assortative mating, you can update Sigma4 accordingly; here we keep your
+# original "all rho except mom-dad = rg_p" logic.
+
+Sigma3 <- matrix(c(
+  1,    rho,  rho,
+  rho,  1,    rg_p,
+  rho,  rg_p, 1
+), nrow = 3, byrow = TRUE)
+
+Sigma4 <- matrix(c(
+  1,    rho,  rho,  rho,
+  rho,  1,    rg_p, rho,
+  rho,  rg_p, 1,    rho,
+  rho,  rho,  rho,  1
+), nrow = 4, byrow = TRUE)
+
+# -----------------------------------------------------------------------------
+# HELPER: BUILD TRUE EFFECT SIZES b GIVEN:
+#   - rel: relative allocation on the b^2 scale (must sum to 1)
+#   - Sigma: covariance matrix of G
+#   - R2tot: desired total variance explained by the genetic signal
+#
+# We assume the outcome is:
+#   P = G %*% b + e
+# with Var(G %*% b) = R2tot and Var(e) = 1 - R2tot,
+# so that (in expectation) total R^2 is R2tot.
+#
+# Interpreting "rel on the b^2 scale":
+#   We set b_j proportional to sqrt(rel_j).
+#   This means b_j^2 : b_k^2 = rel_j : rel_k.
+#   Because the predictors are correlated, these rel values do NOT equal each
+#   predictor's marginal R^2 contributions; they’re just a convenient way to
+#   specify relative coefficients.
+# -----------------------------------------------------------------------------
+make_b <- function(rel, Sigma, R2tot) {
+  stopifnot(abs(sum(rel) - 1) < 1e-8)
+
+  # Coefficient template proportional to sqrt(rel)
+  ratio <- sqrt(rel)
+
+  # Var(G %*% ratio) = ratio' Sigma ratio
+  den <- as.numeric(t(ratio) %*% Sigma %*% ratio)
+
+  # Scale factor so that Var(G %*% b) = R2tot
+  k <- sqrt(R2tot / den)
+
+  # Final coefficients
+  k * ratio
+}
+
+# -----------------------------------------------------------------------------
+# SIMULATION CORE FOR A SINGLE (N, scenario, R2tot)
+#
+# Returns:
+#   c(power_C = ..., power_Pa = ..., power_S = ...)
+# where power is computed for one-sided tests beta > 0 at alpha_one.
+#
+# Notes:
+#   - C is the child score (G1).
+#   - Pa is the (standardized) parental mean score: scale(mom + dad).
+#     Standardizing Pa makes its regression coefficient interpretable on a
+#     comparable scale across simulations.
+#   - S is the sibling score (G4), only present in the "WithSibling" scenario.
+# -----------------------------------------------------------------------------
+simulate_one <- function(n, reps, scenario, R2tot, alpha_one) {
+
+  if (scenario == "NoSibling") {
+    # Only (C, mom, dad) are simulated, and ONLY these have causal effects.
+    # Relative effect allocation on b^2 scale:
+    #   child 60%, mom 20%, dad 20%
+    rel3 <- c(.6, .2, .2)
+    b3   <- make_b(rel3, Sigma3, R2tot)
+
+    # Track significance indicators across reps
+    sigC  <- logical(reps)
+    sigPa <- logical(reps)
+
+    for (r in seq_len(reps)) {
+      # Simulate correlated genetic variables
+      G <- mvrnorm(n, mu = rep(0, 3), Sigma = Sigma3)
+
+      # Generate outcome with total signal variance ~ R2tot
+      P <- as.numeric(G %*% b3) + sqrt(1 - R2tot) * rnorm(n)
+
+      # Construct regression predictors
+      C  <- G[, 1]
+      Pa <- scale(G[, 2] + G[, 3])   # parental mean (standardized)
+
+      # Fit analysis model (matches the data generating causal set)
+      fit <- lm(P ~ C + Pa)
+
+      # Extract t-statistics and df for one-sided testing
+      ct <- summary(fit)$coefficients
+      df <- fit$df.residual
+
+      # One-sided p-values for H1: beta > 0
+      p_C  <- pt(ct["C",  "t value"], df = df, lower.tail = FALSE)
+      p_Pa <- pt(ct["Pa", "t value"], df = df, lower.tail = FALSE)
+
+      sigC[r]  <- (p_C  < alpha_one)
+      sigPa[r] <- (p_Pa < alpha_one)
+    }
+
+    return(c(power_C = mean(sigC), power_Pa = mean(sigPa), power_S = NA_real_))
+  }
+
+  if (scenario == "WithSibling") {
+    # (C, mom, dad, sib) are simulated, and ALL have causal effects.
+    # Relative effect allocation on b^2 scale:
+    #   child 60%, each of mom/dad/sib gets 40/3 = 13.3%
+    rel4 <- c(.6, .4/3, .4/3, .4/3)
+    b4   <- make_b(rel4, Sigma4, R2tot)
+
+    sigC  <- logical(reps)
+    sigPa <- logical(reps)
+    sigS  <- logical(reps)
+
+    for (r in seq_len(reps)) {
+      G <- mvrnorm(n, mu = rep(0, 4), Sigma = Sigma4)
+      P <- as.numeric(G %*% b4) + sqrt(1 - R2tot) * rnorm(n)
+
+      C  <- G[, 1]
+      Pa <- scale(G[, 2] + G[, 3])
+      S  <- G[, 4]
+
+      fit <- lm(P ~ C + Pa + S)
+
+      ct <- summary(fit)$coefficients
+      df <- fit$df.residual
+
+      p_C  <- pt(ct["C",  "t value"], df = df, lower.tail = FALSE)
+      p_Pa <- pt(ct["Pa", "t value"], df = df, lower.tail = FALSE)
+      p_S  <- pt(ct["S",  "t value"], df = df, lower.tail = FALSE)
+
+      sigC[r]  <- (p_C  < alpha_one)
+      sigPa[r] <- (p_Pa < alpha_one)
+      sigS[r]  <- (p_S  < alpha_one)
+    }
+
+    return(c(power_C = mean(sigC), power_Pa = mean(sigPa), power_S = mean(sigS)))
+  }
+
+}
+
+# -----------------------------------------------------------------------------
+# RUN THE FULL GRID: for each R2 setting, for each scenario, for each N
+# -----------------------------------------------------------------------------
+scenarios <- c("NoSibling", "WithSibling")
+
+res_list <- list()
+k <- 1
+
+for (R2tot in R2_grid) {
+  for (sc in scenarios) {
+
+    # vapply returns a numeric vector/matrix with stable type and names
+    # The result 'vec' is a 3 x length(Ns) matrix-like object (named rows).
+    vec <- vapply(
+      Ns,
+      FUN = function(n) simulate_one(n, reps, sc, R2tot, alpha_one),
+      FUN.VALUE = c(power_C = 0, power_Pa = 0, power_S = 0)
+    )
+
+    # Transpose so we have one row per N, columns power_C / power_Pa / power_S
+    out_mat <- t(vec)
+    colnames(out_mat) <- c("power_C", "power_Pa", "power_S")
+
+    # Store results for this (R2, scenario) combination
+    res_list[[k]] <- data.frame(
+      N = Ns,
+      R2 = R2tot,
+      scenario = sc,
+      power_C  = out_mat[, 1],
+      power_Pa = out_mat[, 2],
+      power_S  = out_mat[, 3]
+    )
+    k <- k + 1
+  }
+}
+
+out <- do.call(rbind, res_list)
+
+# -----------------------------------------------------------------------------
+# PREPARE LONG-FORM DATA FOR GGPLOT
+# -----------------------------------------------------------------------------
+# We stack the three power series; power_S is NA in "NoSibling" scenario.
+df_long <- rbind(
+  data.frame(out[, c("N","R2","scenario")], test = "Child (C)",      power = out$power_C),
+  data.frame(out[, c("N","R2","scenario")], test = "Parental (Pa)",  power = out$power_Pa),
+  data.frame(out[, c("N","R2","scenario")], test = "Sibling (S)",    power = out$power_S)
+)
+
+# Drop missing curves (Sibling in NoSibling scenario)
+df_long <- df_long[is.finite(df_long$power), ]
+
+# Friendly facet labels
+df_long$scenario <- factor(
+  df_long$scenario,
+  levels = c("NoSibling", "WithSibling"),
+  labels = c("C + Pa only", "C + Pa + S")
+)
+
+df_long$R2_lab <- factor(
+  df_long$R2,
+  levels = R2_grid,
+  labels = c("Total R² = 1%", "Total R² = 2.5%", "Total R² = 7.5%")
+)
+
+# -----------------------------------------------------------------------------
+# PLOT: 2 ROWS (SCENARIO) x 3 COLUMNS (R^2)
+# Using theme_minimal as requested; larger text for publication readability.
+# -----------------------------------------------------------------------------
+p <- ggplot(df_long, aes(x = N, y = power, color = test)) +
+  geom_line(linewidth = 1.1) +
+  geom_hline(yintercept = c(0.8, 0.9), linetype = "dashed", linewidth = 0.4) +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.2)) +
+  scale_x_continuous(breaks = seq(0, 30000, by = 10000), labels = comma) +
+  labs(
+    title = "Power curves",
+    x = "Sample size (N trios)",
+    y = "Power",
+    linetype = "Effect tested"
+  ) +
+  facet_grid(rows = vars(scenario), cols = vars(R2_lab)) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title   = element_text(size = 18, face = "bold", margin = margin(b = 10)),
+    axis.title.x = element_text(size = 16, margin = margin(t = 8)),
+    axis.title.y = element_text(size = 16, margin = margin(r = 8)),
+    axis.text    = element_text(size = 12),
+    strip.text   = element_text(size = 14, face = "bold"),
+    legend.title = element_text(size = 14),
+    legend.text  = element_text(size = 12),
+    legend.position = "bottom"
+  )
+
+print(p)
+
+# -----------------------------------------------------------------------------
+# OPTIONAL: SAVE HIGH-RES OUTPUTS (uncomment)
+# -----------------------------------------------------------------------------
+# ggsave("power_grid_2x3.png", p, width = 12, height = 7, dpi = 600)
+# ggsave("power_grid_2x3.pdf", p, width = 12, height = 7)
