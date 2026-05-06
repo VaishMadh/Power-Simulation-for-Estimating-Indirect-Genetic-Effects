@@ -1,5 +1,6 @@
 ###############################################################################
 # Power simulation for trio-based regression with genetic predictors
+# Created by Michel Nivard for the paper "Indirect genetic effects on psycho-social development"
 #
 # We simulate correlated polygenic scores / genetic liabilities for:
 #   G1 = Child
